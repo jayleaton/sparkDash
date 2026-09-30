@@ -11,6 +11,7 @@ import { NetworkPanel } from "./NetworkPanel";
 import { TailscalePanel } from "./TailscalePanel";
 import { LlmPanel } from "./LlmPanel";
 import { ComfyPanel } from "./ComfyPanel";
+import { HealthPanel } from "./HealthPanel";
 import { ChevronDownIcon } from "../ui/icons";
 
 interface SparkPageProps {
@@ -25,6 +26,10 @@ const SECTION_OPEN_KEYS = {
   resources: "sparkdash.ui.section.resources",
   services: "sparkdash.ui.section.services",
 } as const;
+
+/** Literal classes so Tailwind's scanner generates them. */
+const ROW_SPANS = ["md:row-span-2", "md:row-span-3", "md:row-span-4", "md:row-span-5"];
+const rowSpan = (rows: number) => ROW_SPANS[Math.min(Math.max(rows, 2), 5) - 2];
 
 function readSectionOpen(key: string, fallback = true): boolean {
   try {
@@ -184,6 +189,9 @@ export function SparkPage({
   const llmOn = isLlmMonitoringEnabled(spark);
   const comfyOn = Boolean(spark.comfyMonitoring);
   const tailscaleOn = Boolean(spark.tailscaleMonitoring);
+  const health = metrics.health ?? null;
+  // The GPU panel spans the right column's stack: one row per extra panel.
+  const extraRows = (tailscaleOn ? 1 : 0) + (health ? 1 : 0);
   /** First LLM + Comfy share a row when both are on. */
   const primarySideBySide = llmOn && comfyOn;
   const showServices = llmOn || comfyOn;
@@ -245,7 +253,7 @@ export function SparkPage({
                   gpu={metrics.gpu}
                   sparkId={spark.id}
                   temperatureUnit={temperatureUnit}
-                  className={tailscaleOn ? "md:row-span-4" : "md:row-span-3"}
+                  className={rowSpan(3 + extraRows)}
                 />
                 <RamPanel
                   ram={metrics.ram}
@@ -268,6 +276,7 @@ export function SparkPage({
                   onStoragePollModeChange={handleStoragePollModeChange}
                 />
                 {tailscaleOn && <TailscalePanel tailscale={metrics.tailscale ?? null} />}
+                {health && <HealthPanel health={health} sparkId={spark.id} />}
               </>
             ) : (
               /* Resources layout: GPU spans the full left column; Storage + Network [+ Tailnet] stack in the right column */
@@ -277,7 +286,7 @@ export function SparkPage({
                   cpu={metrics.cpu}
                   sparkId={spark.id}
                   temperatureUnit={temperatureUnit}
-                  className={tailscaleOn ? "md:row-span-3" : "md:row-span-2"}
+                  className={rowSpan(2 + extraRows)}
                 />
                 <StoragePanel
                   storage={metrics.storage}
@@ -294,6 +303,7 @@ export function SparkPage({
                   onDisabledChange={setDisabledInterfaces}
                 />
                 {tailscaleOn && <TailscalePanel tailscale={metrics.tailscale ?? null} />}
+                {health && <HealthPanel health={health} sparkId={spark.id} />}
               </>
             )}
           </>

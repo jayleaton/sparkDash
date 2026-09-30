@@ -34,6 +34,7 @@ It also supports **non-Spark units**: any Linux machine with an NVIDIA GPU (e.g.
 - [ComfyUI monitoring](#comfyui-monitoring)
 - [Hermes Agent monitoring](#hermes-agent-monitoring)
 - [Tailnet monitoring](#tailnet-monitoring)
+- [Remote Sparks without SSH (sparkdash-agent)](#remote-sparks-without-ssh-sparkdash-agent)
 - [Full changelog](./CHANGELOG.md)
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
@@ -230,6 +231,12 @@ Asked of **each node about itself**. Peer state is never the verdict. The probe 
 | `tailscaleMonitoring` | `false` | Run `tailscale status --json` and show the Tailnet card |
 
 Env (optional): `POLL_INTERVAL_TAILSCALE` (default `30000`), `TAILSCALE_PROBE_TIMEOUT_MS` (default `8000`).
+
+---
+
+## Remote Sparks without SSH (sparkdash-agent)
+
+A remote Spark can be read from a small agent on the Spark instead of by SSH polling. Set `"agent": { "url": "http://<spark-lan-ip>:9110" }` on it in `config/sparks.json` and `SPARKDASH_AGENT_TOKEN` in `.env`. Through Tailscale SSH, each poll is a new login session, and that churn makes polkitd leak memory. The agent answers one HTTP GET per poll and also adds real RoCE traffic on CX7 links and a Memory health panel (MemAvailable, polkitd RSS, 24 h history). Setup and details: [docs/NODE-AGENT.md](./docs/NODE-AGENT.md).
 
 ---
 

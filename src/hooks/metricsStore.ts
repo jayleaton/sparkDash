@@ -130,6 +130,14 @@ export function ingestSnapshots(sparks: SparkSnapshot[], at = Date.now()): void 
     if (m.ram) {
       pushHistory(`${s.id}:ram.percentage`, m.ram.percentage, at);
     }
+    if (m.health) {
+      if (m.health.memAvailableMB != null) {
+        pushHistory(`${s.id}:health.memAvailableMB`, m.health.memAvailableMB, at);
+      }
+      for (const w of m.health.watched) {
+        if (w.rssMB != null) pushHistory(`${s.id}:health.rss.${w.name}`, w.rssMB, at);
+      }
+    }
     if (Array.isArray(m.llm)) {
       // Zip with snapshot.llmPorts so multi-port LLM series key distinctly.
       const ports = s.llmPorts ?? [];

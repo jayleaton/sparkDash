@@ -47,6 +47,8 @@ services:
       # See docs/REMOTE-ACCESS.md; direct non-loopback binds fail closed.
       - BIND_HOST=${BIND_HOST:-127.0.0.1}
       - SPARKDASH_TOKEN=${SPARKDASH_TOKEN:-}
+      # Bearer token for sparkdash-agent on remote Sparks (see docs/NODE-AGENT.md).
+      - SPARKDASH_AGENT_TOKEN=${SPARKDASH_AGENT_TOKEN:-}
       - SPARKDASH_ALLOW_OPEN_REMOTE=${SPARKDASH_ALLOW_OPEN_REMOTE:-1}
       - PORT=5555
       - LLM_PORT=8888

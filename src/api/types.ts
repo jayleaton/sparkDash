@@ -255,6 +255,11 @@ export interface NetworkInterface {
   operstate: string;
   /** Present when interface is in disabledInterfaces; still returned for Settings UI */
   disabled?: boolean;
+  /**
+   * RoCE port behind this interface (agent Sparks). Its speeds then come from
+   * the RDMA port counters, since RoCE traffic bypasses the kernel's.
+   */
+  rdma?: { device: string; state: string; rateGbps: number | null };
 }
 
 export interface NetworkMetrics {
@@ -465,6 +470,28 @@ export interface SparkMetrics {
   comfy?: ComfyMetrics | null;
   /** Tailnet probe result when monitoring is enabled; null when off or not yet polled. */
   tailscale?: TailscaleMetrics | null;
+  /** Memory health from the Spark's sparkdash-agent; null without one. */
+  health?: HealthMetrics | null;
+}
+
+// ─── Memory health (sparkdash-agent) ─────────────────────
+export interface HealthMetrics {
+  memTotalMB: number | null;
+  memAvailableMB: number | null;
+  memFreeMB: number | null;
+  swapTotalMB: number | null;
+  swapUsedMB: number | null;
+  /** Processes the agent watches (polkitd by default); rssMB null while not running. */
+  watched: { name: string; pid: number | null; rssMB: number | null; swapMB: number | null }[];
+  /** The agent's own footprint on the Spark. */
+  agent: { version: string | null; rssMB: number | null; cpuPct: number | null };
+}
+
+/** Downsampled agent memory history (`GET /api/sparks/:id/agent/history`). */
+export interface AgentHistory {
+  intervalS: number;
+  watched: string[];
+  points: { t: number; memAvailableKb: number; watchedRssKb: (number | null)[] }[];
 }
 
 // ─── Spark snapshot (server pushes this) ──────────────────

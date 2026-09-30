@@ -105,6 +105,7 @@ export class SparkMonitor {
       llm: [],
       comfy: null,
       tailscale: null,
+      health: null,
     };
     this._lastUpdate = {};
     this._metricCollectionSuccessful = { gpu: false, cpu: false };
@@ -152,7 +153,8 @@ export class SparkMonitor {
     this._inflight = {};
     this._metricCollectionSuccessful = { gpu: false, cpu: false };
     this.spark = spark;
-    this.collector.spark = spark;
+    this.collector.setSpark(spark);
+    if (!this.collector.agent) this._metrics.health = null;
 
     // Rebuild LLM probe map — add new ports, remove stale ones, update existing
     const ports = this._llmMonitoringEnabled() ? this._llmPorts() : [];
@@ -409,6 +411,7 @@ export class SparkMonitor {
     this._intervals.push(setInterval(() => this._pollDomain("storage"), POLL_INTERVAL_STORAGE));
     this._intervals.push(setInterval(() => this._pollDomain("ram"), POLL_INTERVAL_CPU));
     this._intervals.push(setInterval(() => this._pollDomain("memory"), POLL_INTERVAL_BANDWIDTH));
+    this._intervals.push(setInterval(() => this._pollDomain("health"), POLL_INTERVAL_CPU));
     this._restartLlmPollInterval();
     this._restartComfyPollInterval();
     this._restartHermesPollInterval();
@@ -495,13 +498,16 @@ export class SparkMonitor {
         llm: this._metrics.llm,
         comfy: comfyOn ? this._metrics.comfy : null,
         tailscale: tailscaleOn ? this._metrics.tailscale : null,
+        // Agent Sparks only: MemAvailable, watched-process RSS, agent footprint.
+        health: this._metrics.health,
       },
     };
   }
 
   // ─── Uptime helper ─────────────────────────────────────────
-  /** Read system uptime from /proc/uptime (local or via SSH). */
+  /** Read system uptime from /proc/uptime (local, agent, or via SSH). */
   async _readUptime() {
+    if (this.collector.agent) return this.collector.agentUptime();
     let content;
     if (this.spark.isLocal) {
       const mapped = path.join(HOST_PATHS.PROC, "uptime");
@@ -572,6 +578,7 @@ export class SparkMonitor {
       this._pollDomain("storage"),
       this._pollDomain("ram"),
       this._pollDomain("memory"),
+      this._pollDomain("health"),
       this._pollDomain("llm"),
       this._pollDomain("comfy"),
       this._pollDomain("hermes"),
@@ -611,6 +618,9 @@ export class SparkMonitor {
           break;
         case "memory":
           result = await this.collector.collectUnifiedMemory();
+          break;
+        case "health":
+          result = await this.collector.collectHealth();
           break;
         case "llm":
           // Probe all ports in parallel
@@ -661,6 +671,9 @@ export class SparkMonitor {
           break;
         case "memory":
           this._metrics.unifiedMemory = result;
+          break;
+        case "health":
+          this._metrics.health = result;
           break;
         case "llm":
           this._metrics.llm = result;

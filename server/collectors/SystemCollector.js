@@ -3,6 +3,7 @@ import path from "path";
 import { HOST_PATHS, GPU_MEMORY_JSON_PATH, DGX_SPARK, HARDWARE_DEFAULTS, POLL_INTERVAL_NVERR } from "../config.js";
 import { normalizeMac, WOL_INTERFACE } from "../wol.js";
 import { sshExec } from "./ssh.js";
+import { NodeAgentClient } from "./NodeAgent.js";
 
 const NVERR_JOURNAL_CMD =
   'journalctl -k --no-pager -q --grep=NV_ERR_NO_MEMORY 2>/dev/null | grep -c NV_ERR_NO_MEMORY || true';
@@ -43,6 +44,11 @@ export class SystemCollector {
   constructor(spark) {
     this.spark = spark;
     this._nvidiaSmiPath = this._resolveNvidiaSmiPath();
+    /** Remote Sparks with a sparkdash-agent are read over HTTP, never SSH. */
+    this.agent = spark.agent?.url ? new NodeAgentClient(spark.agent) : null;
+    /** Previous agent disk counters and agent CPU time, for rates. */
+    this._lastAgentDiskIO = new Map();
+    this._lastAgentCpu = null;
 
     // Rate-tracking baselines
     this.lastNetworkStats = new Map();
@@ -70,9 +76,11 @@ export class SystemCollector {
   /** Collect GPU metrics (temperature, usage, power, VRAM). */
   async collectGpu() {
     try {
-      const gpuData = this.spark.isLocal
-        ? await this._getGPUAll()
-        : await this._getRemoteGpu();
+      const gpuData = this.agent
+        ? await this._getAgentGpu()
+        : this.spark.isLocal
+          ? await this._getGPUAll()
+          : await this._getRemoteGpu();
       return tagCollectionResult(gpuData, this._isSuccessfulGpuCollection(gpuData));
     } catch (err) {
       console.error(`[SystemCollector] GPU error for ${this.spark.id}:`, err.message);
@@ -84,6 +92,10 @@ export class SystemCollector {
   async collectCpu() {
     const collectionSequence = ++this._cpuCollectionSequence;
     try {
+      if (this.agent) {
+        const cpuData = await this._getAgentCpu(collectionSequence);
+        return tagCollectionResult(cpuData, this._isSuccessfulCpuCollection(cpuData));
+      }
       if (!this.spark.isLocal) {
         const cpuData = await this._getRemoteCpu(collectionSequence);
         return tagCollectionResult(cpuData, this._isSuccessfulCpuCollection(cpuData));
@@ -152,6 +164,18 @@ export class SystemCollector {
     );
   }
 
+  /** Apply an edited spark config; rebuilds the agent client when its URL changes. */
+  setSpark(spark) {
+    this.spark = spark;
+    const url = spark.agent?.url ?? null;
+    if (url !== (this.agent?.baseUrl ?? null)) {
+      this.agent = url ? new NodeAgentClient(spark.agent) : null;
+      this._lastAgentDiskIO.clear();
+      this._lastAgentCpu = null;
+      this.lastNetworkStats.clear();
+    }
+  }
+
   /** Prevent an earlier monitor lifecycle from updating shared CPU baselines. */
   invalidatePendingCollections() {
     this._cpuCollectionSequence += 1;
@@ -159,6 +183,7 @@ export class SystemCollector {
 
   /** Collect RAM metrics. */
   async collectRam() {
+    if (this.agent) return this._getAgentRam();
     if (!this.spark.isLocal) return this._getRemoteRam();
     try {
       return await this._getRamUsage();
@@ -170,6 +195,7 @@ export class SystemCollector {
 
   /** Collect storage metrics per mount. */
   async collectStorage() {
+    if (this.agent) return this._getAgentStorage();
     if (!this.spark.isLocal) return this._getRemoteStorage();
     try {
       return await this._getDiskUsage();
@@ -181,6 +207,7 @@ export class SystemCollector {
 
   /** Collect network metrics (interfaces, speeds). */
   async collectNetwork() {
+    if (this.agent) return this._getAgentNetwork();
     if (!this.spark.isLocal) return this._getRemoteNetwork();
     try {
       const interfaces = this._tagDisabledInterfaces(await this._getNetworkMetrics());
@@ -201,6 +228,7 @@ export class SystemCollector {
 
   /** Collect unified memory metrics. */
   async collectUnifiedMemory() {
+    if (this.agent) return this._getAgentUnifiedMemory();
     if (!this.spark.isLocal) return this._getRemoteUnifiedMemory();
     try {
       return await this._getUnifiedMemory();
@@ -1001,6 +1029,238 @@ export class SystemCollector {
     };
   }
 
+  // ─── Remote collection via sparkdash-agent (HTTP, no SSH) ─────────────
+  // Every domain reads the same shared snapshot (see NodeAgent.js). Rates use
+  // the agent's own collectedAtMs, and a poll that lands on the same cached
+  // snapshot keeps the previous rate instead of reporting zero.
+
+  async _getAgentGpu() {
+    const snap = await this.agent.snapshot();
+    const g = snap.gpus?.[0];
+    if (!g) throw new Error(snap.gpuError || "agent reports no GPU");
+    const apps = (g.processes || []).map((p) => ({
+      pid: p.pid,
+      name: p.name || "unknown",
+      vramMB: p.usedBytes == null ? 0 : Math.round(p.usedBytes / 1048576),
+    }));
+    this.nvidiaComputeAppsCache.clear();
+    let computeSum = 0;
+    for (const app of apps) {
+      this.nvidiaComputeAppsCache.set(app.pid, { name: app.name, vramMB: app.vramMB });
+      computeSum += app.vramMB;
+    }
+    let used = g.memUsedBytes == null ? null : g.memUsedBytes / 1048576;
+    if ((used == null || used === 0) && computeSum > 0) used = computeSum;
+    const vram = this._poolVram({
+      usedMB: used,
+      totalMB: g.memTotalBytes == null ? null : g.memTotalBytes / 1048576,
+      memTotalMB: Math.round((snap.memory?.totalKb ?? 0) / 1024),
+      availableMB: Math.round((snap.memory?.availableKb ?? 0) / 1024),
+    });
+    const powerDraw = g.powerW ?? 0;
+    const t = g.throttle || {};
+    return {
+      temperature: g.tempC ?? 0,
+      usage: g.utilPct ?? 0,
+      power: { draw: powerDraw, limit: g.powerLimitW ?? 120, systemDraw: Math.round(powerDraw + 20) },
+      vram,
+      processes: [...apps].sort((a, b) => b.vramMB - a.vramMB).slice(0, 5),
+      throttle: this._buildThrottle({
+        hwThermal: t.hwThermal,
+        swThermal: t.swThermal,
+        hwSlowdown: t.hwSlowdown,
+        powerCap: t.swPowerCap,
+        smClockMHz: g.smClockMhz,
+        smClockMaxMHz: g.smClockMaxMhz,
+      }),
+      nvErrNoMemory: snap.nvErrNoMemory ?? 0,
+    };
+  }
+
+  async _getAgentCpu(collectionSequence) {
+    const snap = await this.agent.snapshot();
+    const usage = Math.round(snap.cpu?.usagePct ?? Number.NaN);
+    if (!Number.isFinite(usage)) throw new Error("agent has no CPU sample yet");
+    if (collectionSequence === this._cpuCollectionSequence) this.lastCpuUsagePct = usage;
+    return {
+      usage,
+      temperature: snap.cpu?.tempC ?? 0,
+      ...this._estimateCpuPower(usage, /^(aarch64|arm)/.test(snap.arch || "")),
+    };
+  }
+
+  async _getAgentRam() {
+    try {
+      const m = (await this.agent.snapshot()).memory || {};
+      const totalKB = m.totalKb || 0;
+      const usedKB = totalKB - (m.availableKb || 0);
+      return {
+        used: Math.round(usedKB / 1024),
+        total: Math.round(totalKB / 1024),
+        percentage: totalKB > 0 ? Math.round((usedKB / totalKB) * 100) : 0,
+      };
+    } catch (err) {
+      console.error(`[SystemCollector] Agent RAM error for ${this.spark.id}:`, err.message);
+      return this._defaultRam();
+    }
+  }
+
+  async _getAgentStorage() {
+    try {
+      const snap = await this.agent.snapshot();
+      const disabledDevices = this.spark.disabledDevices || [];
+      const mb = (b) => Math.round((b || 0) / 1048576);
+      return (snap.disks || []).map((d) => {
+        const io = this._agentRates(this._lastAgentDiskIO, d.device, snap.collectedAtMs, {
+          readSpeed: d.readBytes,
+          writeSpeed: d.writeBytes,
+        });
+        const usedAndAvail = (d.usedBytes || 0) + (d.availableBytes || 0);
+        return {
+          device: d.device,
+          label: d.mount,
+          used: mb(d.usedBytes),
+          total: mb(d.totalBytes),
+          available: mb(d.availableBytes),
+          // df rounds up: 1 byte over a percent boundary counts.
+          percentage: usedAndAvail > 0 ? Math.ceil((d.usedBytes / usedAndAvail) * 100) : 0,
+          readSpeed: io.readSpeed,
+          writeSpeed: io.writeSpeed,
+          disabled: disabledDevices.includes(d.device) || disabledDevices.includes(d.mount),
+        };
+      });
+    } catch (err) {
+      console.error(`[SystemCollector] Agent Storage error for ${this.spark.id}:`, err.message);
+      return [];
+    }
+  }
+
+  async _getAgentNetwork() {
+    try {
+      const snap = await this.agent.snapshot();
+      const all = snap.network?.interfaces || [];
+      // RoCE traffic (the CX7 tensor-parallel link) bypasses the kernel's
+      // netdev counters, so for a port with RDMA counters those are the truth.
+      const rdmaByNetdev = new Map(
+        (snap.rdma || []).filter((r) => r.netdev && r.rxBytes != null).map((r) => [r.netdev, r])
+      );
+      const interfaces = all
+        .filter((i) => !this._isVirtualNetworkInterface(i.name))
+        .map((i) => {
+          const r = rdmaByNetdev.get(i.name);
+          const rates = this._agentRates(this.lastNetworkStats, `${i.name}${r ? ":rdma" : ""}`, snap.collectedAtMs, {
+            rxSpeed: r ? r.rxBytes : i.rxBytes,
+            txSpeed: r ? r.txBytes : i.txBytes,
+          });
+          return {
+            name: i.name,
+            rxSpeed: rates.rxSpeed,
+            txSpeed: rates.txSpeed,
+            ip: i.ipv4?.[0] ?? null,
+            operstate: i.operstate || "unknown",
+            disabled: false,
+            ...(r ? { rdma: { device: r.device, state: r.state, rateGbps: r.rateGbps ?? null } } : {}),
+          };
+        });
+      const tagged = this._tagDisabledInterfaces(interfaces);
+      let primaryInterface = snap.network?.defaultInterface ?? null;
+      if (primaryInterface && (this.spark.disabledInterfaces || []).includes(primaryInterface)) {
+        const alt = tagged.find((i) => !i.disabled);
+        primaryInterface = alt?.name ?? primaryInterface;
+      }
+      const byName = (name) => all.find((i) => i.name === name);
+      return {
+        primaryInterface,
+        linkSpeedMbps: (primaryInterface && byName(primaryInterface)?.speedMbps) || null,
+        interfaces: tagged,
+        wolMac: normalizeMac(byName(WOL_INTERFACE)?.mac || ""),
+      };
+    } catch (err) {
+      console.error(`[SystemCollector] Agent Network error for ${this.spark.id}:`, err.message);
+      return this._defaultNetwork();
+    }
+  }
+
+  async _getAgentUnifiedMemory() {
+    try {
+      const snap = await this.agent.snapshot();
+      const totalKB = snap.memory?.totalKb || 0;
+      const availKB = snap.memory?.availableKb || 0;
+      const gpuUsedBytes = (snap.gpus?.[0]?.processes || []).reduce((sum, p) => sum + (p.usedBytes || 0), 0);
+      return this._unifiedFromPool(totalKB, availKB, Math.round(gpuUsedBytes / 1048576));
+    } catch (err) {
+      console.error(`[SystemCollector] Agent Unified Memory error for ${this.spark.id}:`, err.message);
+      return this._defaultUnifiedMemory();
+    }
+  }
+
+  /**
+   * Memory health from the agent: MemAvailable/MemFree, swap, the watched
+   * processes' RSS (polkitd by default, to see the session-churn leak stay
+   * gone) and the agent's own footprint. Null for Sparks without an agent.
+   */
+  async collectHealth() {
+    if (!this.agent) return null;
+    try {
+      const snap = await this.agent.snapshot();
+      const m = snap.memory || {};
+      const mb = (kb) => (kb == null ? null : Math.round(kb / 1024));
+      const a = snap.agent || {};
+      const prev = this._lastAgentCpu;
+      let cpuPct = prev?.cpuPct ?? null;
+      if (prev && snap.collectedAtMs > prev.at && a.cpuSeconds != null) {
+        cpuPct = Math.max(0, ((a.cpuSeconds - prev.cpuSeconds) * 100000) / (snap.collectedAtMs - prev.at));
+      }
+      if (a.cpuSeconds != null) this._lastAgentCpu = { at: snap.collectedAtMs, cpuSeconds: a.cpuSeconds, cpuPct };
+      return {
+        memTotalMB: mb(m.totalKb),
+        memAvailableMB: mb(m.availableKb),
+        memFreeMB: mb(m.freeKb),
+        swapTotalMB: mb(m.swapTotalKb),
+        swapUsedMB: mb((m.swapTotalKb || 0) - (m.swapFreeKb || 0)),
+        watched: (snap.watched || []).map((w) => ({
+          name: w.name,
+          pid: w.pid ?? null,
+          rssMB: mb(w.rssKb),
+          swapMB: mb(w.swapKb),
+        })),
+        agent: {
+          version: a.version ?? null,
+          rssMB: a.rssKb == null ? null : Math.round(a.rssKb / 102.4) / 10,
+          cpuPct: cpuPct == null ? null : Math.round(cpuPct * 100) / 100,
+        },
+      };
+    } catch (err) {
+      console.error(`[SystemCollector] Agent health error for ${this.spark.id}:`, err.message);
+      return null;
+    }
+  }
+
+  /** Uptime (seconds) from the agent; also the liveness check for agent Sparks. */
+  async agentUptime() {
+    const snap = await this.agent.snapshot();
+    return Number.isFinite(snap.uptimeS) ? Math.floor(snap.uptimeS) : null;
+  }
+
+  /**
+   * Per-second rates from cumulative counters keyed by `key` in `store`.
+   * `counters` maps output name → cumulative value (null when unknown).
+   */
+  _agentRates(store, key, at, counters) {
+    const prev = store.get(key);
+    /** @type {Record<string, number>} */
+    const rates = {};
+    if (prev && prev.at === at) return { ...prev.rates };
+    const dtSec = prev ? (at - prev.at) / 1000 : 0;
+    for (const [name, value] of Object.entries(counters)) {
+      const before = prev?.values?.[name];
+      rates[name] =
+        dtSec > 0 && value != null && before != null ? Math.max(0, Math.round((value - before) / dtSec)) : 0;
+    }
+    store.set(key, { at, values: counters, rates });
+    return rates;
+  }
+
   // ─── Remote collection via SSH ────────────────────────────
   async _getRemoteGpu() {
     try {
@@ -1045,22 +1305,9 @@ export class SystemCollector {
       const totalMatch = meminfoOut.match(/MemTotal:\s+(\d+)\s+kB/);
       const availMatch = meminfoOut.match(/MemAvailable:\s+(\d+)\s+kB/);
       const memTotalMB = totalMatch ? Math.round(parseInt(totalMatch[1]) / 1024) : 0;
-      let availableMB = availMatch ? Math.round(parseInt(availMatch[1]) / 1024) : 0;
+      const availableMB = availMatch ? Math.round(parseInt(availMatch[1]) / 1024) : 0;
 
-      const usedMB = Math.round(used || 0);
-      let totalMB = Math.round(total || 0);
-      if (this.spark.kind === "host") {
-        // Discrete GPU VRAM: trust nvidia-smi's memory.total; free VRAM = total − used.
-        if (totalMB <= 0 && memTotalMB > 0) totalMB = memTotalMB;
-        else if (totalMB <= 0) totalMB = DGX_SPARK.MEMORY_HBM_SIZE_GB * 1024; // Convert to MB
-        if (totalMB > 0 && usedMB > 0) availableMB = Math.max(0, totalMB - usedMB);
-      } else {
-        // GB10 shared HBM pool: prefer the OS-visible pool (MemTotal) as the total,
-        // fall back to nvidia-smi, then the hardware spec (HBM) only if nothing known.
-        if (memTotalMB > 0) totalMB = memTotalMB;
-        else if (totalMB <= 0) totalMB = DGX_SPARK.MEMORY_HBM_SIZE_GB * 1024; // Convert to MB
-      }
-      const percentage = totalMB > 0 ? Math.round((usedMB / totalMB) * 100) : 0;
+      const vram = this._poolVram({ usedMB: used, totalMB: total, memTotalMB, availableMB });
 
       // Rough system power estimate: GPU draw + 20W CX7/peripherals
       const systemDraw = Math.round(gpu.powerDraw + 20);
@@ -1075,7 +1322,7 @@ export class SystemCollector {
         temperature: gpu.temperature,
         usage: gpu.usage,
         power: { draw: gpu.powerDraw, limit: gpu.powerLimit, systemDraw },
-        vram: { used: usedMB, total: totalMB, percentage, available: availableMB },
+        vram,
         processes,
         throttle: gpu.throttle,
         nvErrNoMemory: await this._nvErrNoMemory(),
@@ -1133,17 +1380,11 @@ export class SystemCollector {
         this.lastCpuUsagePct = usage;
       }
 
-      // ARM/Neoverse power estimation
       const isArm = /CPU architecture:\s*[89]|aarch64|ARMv[89]|armv[89]/i.test(cpuinfoOut);
-      const tdp = isArm ? 65 : 185;
-      const idleWatts = tdp * 0.08;
-      const draw = idleWatts + (tdp - idleWatts) * Math.min(usage / 100, 1);
-
       return {
         usage,
         temperature: this._parseSensorTemp(tempOut),
-        draw: Math.round(draw * 10) / 10,
-        tdp: Math.round(tdp),
+        ...this._estimateCpuPower(usage, isArm),
       };
     } catch (err) {
       console.error(`[SystemCollector] Remote CPU error for ${this.spark.id}:`, err.message);
@@ -1377,7 +1618,6 @@ export class SystemCollector {
       const availMatch = memOut.match(/MemAvailable:\s+(\d+)\s+kB/);
       const totalKB = totalMatch ? parseInt(totalMatch[1]) : 0;
       const availKB = availMatch ? parseInt(availMatch[1]) : 0;
-      const totalMB = Math.round(totalKB / 1024);
 
       // GPU memory from nvidia-smi compute apps (pid,process_name,used_gpu_memory)
       let gpuUsedMB = 0;
@@ -1389,29 +1629,61 @@ export class SystemCollector {
       }
       gpuUsedMB = Math.round(gpuUsedMB);
 
-      // CPU memory = total - available - GPU
-      const systemUsedKB = totalKB - availKB;
-      const cpuUsedKB = Math.max(0, systemUsedKB - (gpuUsedMB * 1024));
-      const cpuUsedMB = Math.round(cpuUsedKB / 1024);
-
-      const usedMB = gpuUsedMB + cpuUsedMB;
-      const percentage = totalMB > 0 ? Math.round((usedMB / totalMB) * 100) : 0;
-      const oomRisk = percentage > 85 ? "high" : percentage > 60 ? "medium" : "low";
-
-      return {
-        total: totalMB,
-        gpuUsed: gpuUsedMB,
-        cpuUsed: cpuUsedMB,
-        used: usedMB,
-        available: Math.round(availKB / 1024),
-        percentage,
-        oomRisk,
-        bandwidth: { current: 0, peak: 400 },
-      };
+      return this._unifiedFromPool(totalKB, availKB, gpuUsedMB);
     } catch (err) {
       console.error(`[SystemCollector] Remote Unified Memory error for ${this.spark.id}:`, err.message);
       return this._defaultUnifiedMemory();
     }
+  }
+
+  /**
+   * VRAM figures for a GPU. GB10 shares one pool with the OS, so its total is
+   * MemTotal and "available" is MemAvailable; a discrete GPU (kind "host")
+   * trusts the GPU's own total and free = total − used.
+   */
+  _poolVram({ usedMB: used, totalMB: total, memTotalMB, availableMB }) {
+    const usedMB = Math.round(used || 0);
+    let totalMB = Math.round(total || 0);
+    let available = availableMB;
+    if (this.spark.kind === "host") {
+      if (totalMB <= 0 && memTotalMB > 0) totalMB = memTotalMB;
+      else if (totalMB <= 0) totalMB = DGX_SPARK.MEMORY_HBM_SIZE_GB * 1024; // Convert to MB
+      if (totalMB > 0 && usedMB > 0) available = Math.max(0, totalMB - usedMB);
+    } else {
+      // Prefer the OS-visible pool (MemTotal), then the GPU's figure, then the spec.
+      if (memTotalMB > 0) totalMB = memTotalMB;
+      else if (totalMB <= 0) totalMB = DGX_SPARK.MEMORY_HBM_SIZE_GB * 1024; // Convert to MB
+    }
+    const percentage = totalMB > 0 ? Math.round((usedMB / totalMB) * 100) : 0;
+    return { used: usedMB, total: totalMB, percentage, available };
+  }
+
+  /** ARM/Neoverse vs x86 power estimate from utilisation (no RAPL remotely). */
+  _estimateCpuPower(usage, isArm) {
+    const tdp = isArm ? 65 : 185;
+    const idleWatts = tdp * 0.08;
+    const draw = idleWatts + (tdp - idleWatts) * Math.min(usage / 100, 1);
+    return { draw: Math.round(draw * 10) / 10, tdp: Math.round(tdp) };
+  }
+
+  /** Unified memory split: CPU = total − available − GPU processes. */
+  _unifiedFromPool(totalKB, availKB, gpuUsedMB) {
+    const totalMB = Math.round(totalKB / 1024);
+    const cpuUsedKB = Math.max(0, totalKB - availKB - gpuUsedMB * 1024);
+    const cpuUsedMB = Math.round(cpuUsedKB / 1024);
+    const usedMB = gpuUsedMB + cpuUsedMB;
+    const percentage = totalMB > 0 ? Math.round((usedMB / totalMB) * 100) : 0;
+    const oomRisk = percentage > 85 ? "high" : percentage > 60 ? "medium" : "low";
+    return {
+      total: totalMB,
+      gpuUsed: gpuUsedMB,
+      cpuUsed: cpuUsedMB,
+      used: usedMB,
+      available: Math.round(availKB / 1024),
+      percentage,
+      oomRisk,
+      bandwidth: { current: 0, peak: 400 },
+    };
   }
 
   // ─── Host namespace / Docker helpers ──────────────────────
@@ -1466,6 +1738,21 @@ export class SystemCollector {
       let cpuinfo = "";
       let meminfo = "";
       let coresParsed = null;
+      if (this.agent) {
+        const snap = await this.agent.snapshot();
+        const gpu = snap.gpus?.[0];
+        return {
+          device: "Linux GPU host",
+          cpuModel: snap.cpu?.model ?? null,
+          cpuCores: snap.cpu?.cores > 0 ? snap.cpu.cores : null,
+          totalMemoryGB: snap.memory?.totalKb
+            ? Math.max(1, Math.round(snap.memory.totalKb / 1024 / 1024))
+            : null,
+          gpuChip: gpu?.name ?? null,
+          cudaDriver: snap.gpuDriver ?? null,
+          storageModel: null,
+        };
+      }
       if (this.spark.isLocal) {
         const results = await Promise.all([
           this._nvidiaSmi(

@@ -7,6 +7,12 @@ Format: version sections are listed newest first.
 
 ---
 
+## Unreleased
+
+- **Remote Sparks without SSH polling.** A Spark with `"agent": { "url": ... }` is read from sparkdash-agent over HTTP (one shared snapshot per poll) instead of ~5 `sshExec` calls every 2 s. Through Tailscale SSH each of those was a login session, which made polkitd leak about 1 GiB/day. See `docs/NODE-AGENT.md`.
+- **RoCE traffic on CX7 links** (agent Sparks): interfaces backed by an RDMA port report the port counters, since RoCE bypasses the kernel's.
+- **Memory health panel** (agent Sparks): MemAvailable/MemFree/swap, watched-process RSS (polkitd), a 24 h MemAvailable chart, and the agent's footprint.
+
 ## [Unreleased]
 
 ### Added

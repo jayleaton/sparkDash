@@ -6,6 +6,7 @@ import type {
   HermesUpdatesResponse,
   LlmMetrics,
   LlmDailyResponse,
+  AgentHistory,
   Settings,
   ShowcaseListResponse,
   ShowcaseSessionState,
@@ -61,6 +62,11 @@ export function fetchSparkMetrics(id: string): Promise<{
 }
 
 /** Daily busy tok/s rollups for one Spark LLM port. */
+/** Memory history (≈24 h) from a Spark's sparkdash-agent, downsampled for charts. */
+export function fetchAgentHistory(id: string): Promise<AgentHistory> {
+  return apiFetch(`/api/sparks/${encodeURIComponent(id)}/agent/history`);
+}
+
 export function fetchLlmDaily(
   id: string,
   port: number,

@@ -3,6 +3,7 @@ import { SPARKS_JSON_PATH, LLM_PORT } from "../config.js";
 import { loadSecrets, saveSecrets } from "../secretsStore.js";
 import { atomicWrite } from "../util/atomicWrite.js";
 import { isValidSparkId } from "../validate.js";
+import { normalizeAgentConfig } from "../collectors/NodeAgent.js";
 
 /**
  * SparkRegistry — loads, persists, and emits change events for the Spark list.
@@ -72,7 +73,9 @@ export class SparkRegistry {
       );
     }
     if (this.getSpark(config.id)) throw new Error(`Spark ${config.id} already exists`);
-    const spark = this._normalizeConfig(config);
+    // The agent endpoint receives SPARKDASH_AGENT_TOKEN, so only
+    // config/sparks.json may set it — never the HTTP API.
+    const spark = this._normalizeConfig({ ...config, agent: null });
     const nextSparks = [...this._sparks, spark];
     this._save(nextSparks);
     try {
@@ -115,9 +118,14 @@ export class SparkRegistry {
     const idx = this._sparks.findIndex((s) => s.id === id);
     if (idx === -1) throw new Error(`Spark ${id} not found`);
 
-    // Client cannot set detectedMacAddress (auto from enP7s7 only)
-    const { id: _ignoreId, detectedMacAddress: _ignoreDetected, ...rawUpdates } =
-      updates || {};
+    // Client cannot set detectedMacAddress (auto from enP7s7 only) or the
+    // agent endpoint (config file only; it is sent SPARKDASH_AGENT_TOKEN).
+    const {
+      id: _ignoreId,
+      detectedMacAddress: _ignoreDetected,
+      agent: _ignoreAgent,
+      ...rawUpdates
+    } = updates || {};
     const prev = this._sparks[idx];
 
     /** @type {Record<string, unknown>} */
@@ -629,6 +637,11 @@ export class SparkRegistry {
       disabledDevices: Array.isArray(config.disabledDevices) ? config.disabledDevices : [],
       disabledInterfaces: Array.isArray(config.disabledInterfaces) ? config.disabledInterfaces : [],
       storagePollDisabled: Boolean(config.storagePollDisabled),
+      /**
+       * sparkdash-agent endpoint ({ url }) — when set, metrics come from the
+       * agent over HTTP instead of SSH polling. Token: SPARKDASH_AGENT_TOKEN.
+       */
+      agent: normalizeAgentConfig(config.agent),
     };
   }
 

@@ -9,6 +9,7 @@ import dotenv from "dotenv";
 import { SparkRegistry } from "./sparks/SparkRegistry.js";
 import { SparkMonitor } from "./sparks/SparkMonitor.js";
 import { sshExec } from "./collectors/ssh.js";
+import { downsampleHistory } from "./collectors/NodeAgent.js";
 import { comfyCancelJob } from "./collectors/comfyActions.js";
 import {
   validateSparkTarget,
@@ -496,6 +497,24 @@ app.get("/api/sparks/:id/metrics", (req, res) => {
   const monitor = monitors.get(req.params.id);
   if (!monitor) return res.status(404).json({ error: "Spark not found" });
   res.json(monitor.snapshot());
+});
+
+/** Memory history from the Spark's sparkdash-agent (≈24 h), downsampled for charts. */
+app.get("/api/sparks/:id/agent/history", async (req, res) => {
+  const monitor = monitors.get(req.params.id);
+  if (!monitor) return res.status(404).json({ error: "Spark not found" });
+  const agent = monitor.collector.agent;
+  if (!agent) return res.status(404).json({ error: "No sparkdash-agent configured for this Spark" });
+  try {
+    const history = await agent.history();
+    res.json({
+      intervalS: history.intervalS,
+      watched: history.watched,
+      points: downsampleHistory(history.points || []),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
 });
 
 // Test SSH + LLM connectivity for a registered Spark.

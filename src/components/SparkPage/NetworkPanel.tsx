@@ -157,6 +157,14 @@ export function NetworkPanel({
                       ) : (
                         <span className="truncate">{iface.name}</span>
                       )}
+                      {iface.rdma && (
+                        <span
+                          className="chip shrink-0 py-0.5 text-[10px]"
+                          title={`${iface.rdma.device} (${iface.rdma.state}) — RoCE traffic from the RDMA port counters`}
+                        >
+                          RoCE{iface.rdma.rateGbps != null ? ` ${iface.rdma.rateGbps} Gb/s` : ""}
+                        </span>
+                      )}
                     </span>
                     <span className="font-tabular text-xs text-text">
                       <span className="text-accent">↑</span> {formatSpeed(iface.txSpeed)}
